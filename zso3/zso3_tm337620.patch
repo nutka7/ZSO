@@ -1,0 +1,528 @@
+From dd4104da00d1d05a32bd3e8f08677684f7782972 Mon Sep 17 00:00:00 2001
+From: Tom Macieszczak <tm337620@students.mimuw.edu.pl>
+Date: Thu, 14 Jun 2018 14:12:12 +0200
+Subject: [PATCH] Final
+
+---
+ arch/x86/entry/common.c            |   6 +-
+ arch/x86/include/asm/thread_info.h |   2 +
+ fs/file.c                          |  77 ++++++++++++
+ include/linux/ptrace.h             |   2 +
+ include/linux/ptrace_remote.h      |  70 +++++++++++
+ include/linux/sched.h              |   2 +
+ kernel/fork.c                      |   3 +
+ kernel/ptrace.c                    | 237 +++++++++++++++++++++++++++++++++++++
+ 8 files changed, 398 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/ptrace_remote.h
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index bdd9cc5..e06efe0 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -129,7 +129,8 @@ static long syscall_trace_enter(struct pt_regs *regs)
+ 
+ #define EXIT_TO_USERMODE_LOOP_FLAGS				\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |	\
+-	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY)
++	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY |		\
++	 _TIF_REMOTE)
+ 
+ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ {
+@@ -148,6 +149,9 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+ 		if (cached_flags & _TIF_NEED_RESCHED)
+ 			schedule();
+ 
++		if (cached_flags & _TIF_REMOTE)
++			do_remote_request();
++
+ 		if (cached_flags & _TIF_UPROBE)
+ 			uprobe_notify_resume(regs);
+ 
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index ad6f5eb..7deca4e 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -99,6 +99,7 @@ struct thread_info {
+ #define TIF_SYSCALL_TRACEPOINT	28	/* syscall tracepoint instrumentation */
+ #define TIF_ADDR32		29	/* 32-bit address space on 64 bits */
+ #define TIF_X32			30	/* 32-bit native x86-64 binary */
++#define TIF_REMOTE		31	/* ptrace remote request pending */
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+@@ -121,6 +122,7 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_ADDR32		(1 << TIF_ADDR32)
+ #define _TIF_X32		(1 << TIF_X32)
++#define _TIF_REMOTE		(1 << TIF_REMOTE)
+ 
+ /*
+  * work to do in syscall_trace_enter().  Also includes TIF_NOHZ for
+diff --git a/fs/file.c b/fs/file.c
+index 69d6990..4a00dd9 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -886,6 +886,83 @@ int replace_fd(unsigned fd, struct file *file, unsigned flags)
+ 	return err;
+ }
+ 
++static struct file *remote_fget(struct files_struct *files, unsigned int fd)
++{
++	struct file *file;
++
++	rcu_read_lock();
++	file = fcheck_files(files, fd);
++	if (file) {
++		/* File object ref couldn't be taken */
++		if (!atomic_long_inc_not_zero(&file->f_count))
++			file = NULL;
++	}
++	rcu_read_unlock();
++
++	return file;
++}
++
++int remote_dup3(
++	struct files_struct *oldfiles, unsigned int oldfd,
++	struct files_struct *newfiles, unsigned int newfd,
++	int flags)
++{
++	int err = -EBADF;
++	struct file *file;
++
++	if ((flags & ~O_CLOEXEC) != 0)
++		return -EINVAL;
++
++	if (newfd >= rlimit(RLIMIT_NOFILE))
++		return -EBADF;
++
++	/* Prevent other threads from releasing the file in the meantime. */
++	file = remote_fget(oldfiles, oldfd);
++
++	if (unlikely(!file))
++		return -EBADF;
++
++	spin_lock(&newfiles->file_lock);
++	err = expand_files(newfiles, newfd);
++
++	if (unlikely(err < 0)) {
++		if (err == -EMFILE)
++			err = -EBADF;
++		goto out_unlock;
++	}
++	err = do_dup2(newfiles, file, newfd, flags);
++	fput(file); /* Release the extra reference. */
++	return err;
++
++out_unlock:
++	spin_unlock(&newfiles->file_lock);
++	fput(file);
++	return err;
++}
++
++int remote_dup(
++	struct files_struct *oldfiles, unsigned int oldfd,
++	struct files_struct *newfiles, int flags)
++{
++	int ret = -EBADF;
++	struct file *file;
++
++	if ((flags & ~O_CLOEXEC) != 0)
++		return -EINVAL;
++
++	file = remote_fget(oldfiles, oldfd);
++
++	if (file) {
++		ret = __alloc_fd(newfiles, 0, rlimit(RLIMIT_NOFILE), flags);
++		if (ret >= 0)
++			__fd_install(newfiles, ret, file);
++		else
++			fput(file);
++	}
++
++	return ret;
++}
++
+ SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
+ {
+ 	int err = -EBADF;
+diff --git a/include/linux/ptrace.h b/include/linux/ptrace.h
+index e0e5393..802c086 100644
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -408,4 +408,6 @@ extern int task_current_syscall(struct task_struct *target, long *callno,
+ 				unsigned long args[6], unsigned int maxargs,
+ 				unsigned long *sp, unsigned long *pc);
+ 
++extern void do_remote_request(void);
++
+ #endif
+diff --git a/include/linux/ptrace_remote.h b/include/linux/ptrace_remote.h
+new file mode 100644
+index 0000000..06b2045
+--- /dev/null
++++ b/include/linux/ptrace_remote.h
+@@ -0,0 +1,70 @@
++#ifndef PTRACE_REMOTE_H
++#define PTRACE_REMOTE_H
++
++#ifdef __KERNEL__
++#include <linux/kernel.h>
++#else
++#include <stdint.h>
++#endif
++
++#define PTRACE_REMOTE_MMAP	50
++#define PTRACE_REMOTE_MUNMAP	51
++#define PTRACE_REMOTE_MREMAP	52
++#define PTRACE_REMOTE_MPROTECT	53
++#define PTRACE_DUP_TO_REMOTE	54
++#define PTRACE_DUP2_TO_REMOTE	55
++#define PTRACE_DUP_FROM_REMOTE	56
++#define PTRACE_REMOTE_CLOSE	57
++
++struct ptrace_remote_mmap {
++	uint64_t addr;
++	uint64_t length;
++	uint32_t prot;
++	uint32_t flags;
++	uint32_t fd;
++	uint32_t _pad;
++	uint64_t offset;
++};
++
++struct ptrace_remote_munmap {
++	uint64_t addr;
++	uint64_t length;
++};
++
++struct ptrace_remote_mremap {
++	uint64_t old_addr;
++	uint64_t old_size;
++	uint64_t new_addr;
++	uint64_t new_size;
++	uint32_t flags;
++	uint32_t _pad;
++};
++
++struct ptrace_remote_mprotect {
++	uint64_t addr;
++	uint64_t length;
++	uint32_t prot;
++	uint32_t _pad;
++};
++
++struct ptrace_dup_to_remote {
++	uint32_t local_fd;
++	uint32_t flags;
++};
++
++struct ptrace_dup2_to_remote {
++	uint32_t local_fd;
++	uint32_t remote_fd;
++	uint32_t flags;
++};
++
++struct ptrace_dup_from_remote {
++	uint32_t remote_fd;
++	uint32_t flags;
++};
++
++struct ptrace_remote_close {
++	uint32_t remote_fd;
++};
++
++#endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 75d9a57..0d76c4b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1486,6 +1486,8 @@ struct task_struct {
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
+ 
++	void *remote_request;
++
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+ 	int on_cpu;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index ba8a015..297d93a 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1706,6 +1706,9 @@ static __latent_entropy struct task_struct *copy_process(
+ #endif
+ 	clear_all_latency_tracing(p);
+ 
++	clear_tsk_thread_flag(p, TIF_REMOTE);
++	p->remote_request = NULL;
++
+ 	/* ok, now we should be set up.. */
+ 	p->pid = pid_nr(pid);
+ 	if (clone_flags & CLONE_THREAD) {
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 49ba7c1..b5e0a84 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -27,6 +27,35 @@
+ #include <linux/cn_proc.h>
+ #include <linux/compat.h>
+ 
++#include <linux/file.h>
++#include <linux/ptrace_remote.h>
++#include <linux/freezer.h>
++#include <linux/mman.h>
++
++struct ptrace_remote_request {
++	long request;
++	union {
++		struct ptrace_remote_mmap	mmap;
++		struct ptrace_remote_munmap	munmap;
++		struct ptrace_remote_mremap	mremap;
++		struct ptrace_remote_mprotect	mprotect;
++	};
++	struct completion *comp;
++	struct task_struct *tracer;
++	int result;
++};
++
++int __close_fd(struct files_struct *files, unsigned fd);
++
++int remote_dup3(
++	struct files_struct *oldfiles, unsigned int oldfd,
++	struct files_struct *newfiles, unsigned int newfd,
++	int flags);
++
++int remote_dup(
++	struct files_struct *oldfiles, unsigned int oldfd,
++	struct files_struct *newfiles, int flags);
++
+ /*
+  * Access another process' address space via ptrace.
+  * Source/target buffer must be kernel space,
+@@ -867,6 +896,191 @@ static int ptrace_regset(struct task_struct *task, int req, unsigned int type,
+ EXPORT_SYMBOL_GPL(task_user_regset_view);
+ #endif
+ 
++int ptrace_dup_to_remote(struct task_struct *child, void __user *datavp)
++{
++	struct ptrace_dup_to_remote arg;
++
++	if (copy_from_user(&arg, datavp, sizeof arg))
++		return -EFAULT;
++
++	return remote_dup(
++		current->files, arg.local_fd,
++		child->files, arg.flags);
++}
++
++int ptrace_dup2_to_remote(struct task_struct *child, void __user *datavp)
++{
++	struct ptrace_dup2_to_remote arg;
++
++	if (copy_from_user(&arg, datavp, sizeof arg))
++		return -EFAULT;
++
++	return remote_dup3(
++		current->files, arg.local_fd,
++		child->files, arg.remote_fd,
++		arg.flags);
++}
++
++int ptrace_dup_from_remote(struct task_struct *child, void __user *datavp)
++{
++	struct ptrace_dup_from_remote arg;
++
++	if (copy_from_user(&arg, datavp, sizeof arg))
++		return -EFAULT;
++
++	return remote_dup(
++		child->files, arg.remote_fd,
++		current->files, arg.flags);
++}
++
++int ptrace_remote_close(struct task_struct *child, void __user *datavp)
++{
++	struct ptrace_remote_close arg;
++
++	if (copy_from_user(&arg, datavp, sizeof arg))
++		return -EFAULT;
++
++	return __close_fd(child->files, arg.remote_fd);
++}
++
++int ptrace_remote_request(long request,
++	struct task_struct *child, void __user *datavp)
++{
++	struct ptrace_remote_request r;
++	DECLARE_COMPLETION_ONSTACK(comp);
++
++	r.request = request;
++	r.comp = &comp;
++	r.tracer = current;
++
++	switch (request) {
++	case PTRACE_REMOTE_MMAP:
++		if (copy_from_user(&r.mmap, datavp, sizeof r.mmap))
++			return -EFAULT;
++		break;
++	case PTRACE_REMOTE_MUNMAP:
++		if (copy_from_user(&r.munmap, datavp, sizeof r.munmap))
++			return -EFAULT;
++		break;
++	case PTRACE_REMOTE_MREMAP:
++		if (copy_from_user(&r.mremap, datavp, sizeof r.mremap))
++			return -EFAULT;
++		break;
++	case PTRACE_REMOTE_MPROTECT:
++		if (copy_from_user(&r.mprotect, datavp, sizeof r.mprotect))
++			return -EFAULT;
++		break;
++	}
++
++	child->remote_request = &r;
++	set_tsk_thread_flag(child, TIF_REMOTE);
++	wake_up_state(child, __TASK_TRACED);
++	wait_for_completion(&comp);
++	wait_task_inactive(child, 0);
++
++	switch (request) {
++		case PTRACE_REMOTE_MMAP:
++			if (!r.result &&
++			copy_to_user(datavp, &r.mmap, sizeof r.mmap))
++				return -EFAULT;
++			break;
++		case PTRACE_REMOTE_MREMAP:
++			if (!r.result &&
++			copy_to_user(datavp, &r.mremap, sizeof r.mremap))
++				return -EFAULT;
++			break;
++		case PTRACE_REMOTE_MUNMAP:
++		case PTRACE_REMOTE_MPROTECT:
++			break;
++	}
++
++	return r.result;
++}
++
++void do_remote_request(void)
++{
++	struct ptrace_remote_request *r;
++
++	r = current->remote_request;
++
++	switch (r->request) {
++		case PTRACE_REMOTE_MMAP:
++		{
++			struct ptrace_remote_mmap *arg;
++			int fd = -1;
++			long ret;
++
++			arg = &r->mmap;
++			if (offset_in_page(arg->offset)) {
++				r->result = -EINVAL;
++				break;
++			}
++
++			if (~arg->flags & MAP_ANONYMOUS) {
++				fd = remote_dup(r->tracer->files, arg->fd,
++					current->files, 0);
++				if (fd <= 0) {
++					r->result = fd;
++					break;
++				}
++			}
++
++			ret = sys_mmap_pgoff(
++				arg->addr, arg->length, arg->prot,
++				arg->flags, fd, arg->offset >> PAGE_SHIFT);
++
++			if (~arg->flags & MAP_ANONYMOUS)
++				__close_fd(current->files, fd);
++
++			if (ret >= 0) {
++				arg->addr = ret;
++				r->result = 0;
++			} else
++				r->result = ret;
++			break;
++		}
++		case PTRACE_REMOTE_MUNMAP:
++		{
++			struct ptrace_remote_munmap *arg;
++
++			arg = &r->munmap;
++			r->result = sys_munmap(arg->addr, arg->length);
++			break;
++		}
++		case PTRACE_REMOTE_MREMAP:
++		{
++			struct ptrace_remote_mremap *arg;
++			long ret;
++
++			arg = &r->mremap;
++			ret = sys_mremap(
++				arg->old_addr, arg->old_size, arg->new_size,
++				arg->flags, arg->new_addr);
++
++			if (ret >= 0) {
++				arg->new_addr = ret;
++				r->result = 0;
++			} else
++				r->result = ret;
++			break;
++		}
++		case PTRACE_REMOTE_MPROTECT:
++		{
++			struct ptrace_remote_mprotect *arg;
++
++			arg = &r->mprotect;
++			r->result = sys_mprotect(
++				arg->addr, arg->length, arg->prot);
++			break;
++		}
++	}
++
++	clear_tsk_thread_flag(current, TIF_REMOTE);
++	complete(r->comp);
++	set_current_state(__TASK_TRACED);
++	freezable_schedule();
++}
++
+ int ptrace_request(struct task_struct *child, long request,
+ 		   unsigned long addr, unsigned long data)
+ {
+@@ -1079,6 +1293,29 @@ int ptrace_request(struct task_struct *child, long request,
+ 		ret = seccomp_get_filter(child, addr, datavp);
+ 		break;
+ 
++	case PTRACE_REMOTE_MMAP:
++	case PTRACE_REMOTE_MUNMAP:
++	case PTRACE_REMOTE_MREMAP:
++	case PTRACE_REMOTE_MPROTECT:
++		ret = ptrace_remote_request(request, child, datavp);
++		break;
++
++	case PTRACE_DUP_TO_REMOTE:
++		ret = ptrace_dup_to_remote(child, datavp);
++		break;
++
++	case PTRACE_DUP2_TO_REMOTE:
++		ret = ptrace_dup2_to_remote(child, datavp);
++		break;
++
++	case PTRACE_DUP_FROM_REMOTE:
++		ret = ptrace_dup_from_remote(child, datavp);
++		break;
++
++	case PTRACE_REMOTE_CLOSE:
++		ret = ptrace_remote_close(child, datavp);
++		break;
++
+ 	default:
+ 		break;
+ 	}
+-- 
+2.7.4
+

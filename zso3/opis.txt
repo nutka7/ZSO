@@ -1,0 +1,16 @@
+** ZSO 2018 - ZADANIE 3 **
+* Autor: Tom Macieszczak, indeks: 337620*
+
+** Opis rozwiązania **
+
+Obsługę nowych requestów dodałem w funkcji ptrace_request (kernel/ptrace.c).
+Gdy ptrace weszło do tej funkcji, zostały już dokonane podstawowe checki (czy proces istnieje itd.), tracee został zamrożony i można na nim bezpiecznie operować.
+Nowe operacje pilnują, by po ich zakończeniu tracee był w tym samym stanie.
+
+Operacje typu dup* zrealizowałem poprzez dodanie w fs/file.c funkcji pozwalających procesowi trzeciemu na wykonanie operacji dup* między dowolnymi dwoma procesami w systemie. Następnie dodałem w kernel/ptrace.c odpowiednie wrappery do tych funkcji.
+
+Operacje na pamięci realizuję poprzez "kopnięcie tracee, by sam je zrobił".
+Mianowicie wprowadzam dla task_structa nową flagę TIF_REMOTE.
+Gdy tracer chce, by tracee wykonał jakąś operację, zapisuje w polu tracee->remote_request wskaźnik na dane operacji, ustawia tracee->flags |= TIF_REMOTE, budzi tracee i zasypia w oczekiwaniu na zakończenie operacji przez tracee.
+Tracee w exit_to_usermode_loop (arch/x86/entry/common.c) widzi flagę TIF_REMOTE, więc patrzy w current->remote_request, robi to, o co go poproszono, po czym gasi flagę, budzi tracera i na nowo zasypia w trybie __TASK_TRACED.
+Po obudzeniu tracer upewnia się, że tracee już zasnął.

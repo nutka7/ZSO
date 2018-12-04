@@ -1,0 +1,9 @@
+#define ALIEN_KEY_ENTER 0x0a
+#define ALIEN_KEY_UP 0x80
+#define ALIEN_KEY_LEFT 0x81
+#define ALIEN_KEY_DOWN 0x82
+#define ALIEN_KEY_RIGHT 0x83
+#define ALIEN_ASCII_MIN 0x20
+#define ALIEN_ASCII_MAX 0x7e
+
+#define PT_PARAMS 0x60031337

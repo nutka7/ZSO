@@ -1,0 +1,23 @@
+Author: Tom Macieszczak 337620
+Subject: ZSO
+Task 1: ELFs and aliens
+
+How to compile:
+    Enter the directory containing the solution and run `make`.
+
+How to emulate an alien program:
+    Enter the directory containing the solution and run
+    `./emu <prog> <arg1> <arg2> ...`
+    For example: `./emu ./prog 100`
+
+The emulator consists of two main components:
+    emu.c
+    loader.c
+
+Assume `./emu <prog> <arg1> <arg2> ...` is run.
+The emu.c process starts, forks and hangs on waitpid.
+The child execves loader.c which maps all necessary bits from the <prog> file and <arg.>s into memory. When it's done it calls ptrace(PTRACE_TRACEME, ...) and raises SIGSTOP. At this point the child stops and the parent returns from waitpid. The parent starts tracing and emulating syscalls. The child jumps to the starting point of the alien program.
+
+If anything unexpected happens (e.g. a signal is delivered to the child process) the emulator exits with 127 and an error message is appended to the "emulog" file. Please note it's not always possible to behave gracefully on error (e.g. when emu.c is sigkilled).
+
+Disclaimer: In order to emulate 16 different colors from the description of the task a mix of (foreground, background) colors is used. The aliens perceive colors differently anyway...
